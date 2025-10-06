@@ -2,7 +2,10 @@ const express = require('express');
 const router = express.Router();
 const jornadaController = require('../controllers/jornadaController');
 
-// Ruta para obtener todas las jornadas
+// Ruta optimizada para obtener jornadas paginadas
+router.get('/paginadas', jornadaController.obtenerJornadasPaginadas);
+
+// Ruta para obtener todas las jornadas (legacy)
 router.get('/', jornadaController.obtenerJornadas);
 
 router.get('/operario/:operarioId/fecha/:fecha', jornadaController.obtenerJornadasPorOperarioYFecha); // Ruta para obtener jornada por operario y fecha

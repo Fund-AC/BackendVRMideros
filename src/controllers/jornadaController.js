@@ -940,3 +940,174 @@ exports.obtenerReporteJornadasPermisos = async (req, res) => {
         });
     }
 };
+
+// @desc    Obtener jornadas paginadas (OPTIMIZACIÓN)
+// @route   GET /api/jornadas/paginadas
+exports.obtenerJornadasPaginadas = async (req, res) => {
+    try {
+        const { 
+            page = 1, 
+            limit = 10, 
+            operario, 
+            fechaInicio, 
+            fechaFin,
+            includeRegistros = 'false' 
+        } = req.query;
+
+        const skip = (page - 1) * limit;
+        let operarios = [];
+
+        // Filtros
+        if (operario) {
+            const Operario = require('../models/Operario');
+            const operariosDocs = await Operario.find({
+                name: { $regex: operario, $options: 'i' }
+            }).select('_id');
+            operarios = operariosDocs;
+        }
+
+        // Modificar query para obtener solo jornadas con registros de Horario/Permiso Laboral
+        const Produccion = require('../models/Produccion');
+        
+        // Buscar registros que sean de tipo Horario Laboral o Permiso Laboral
+        const registrosLaborales = await Produccion.find({
+            tipoTiempo: { $in: ['Horario Laboral', 'Permiso Laboral'] },
+            ...(fechaInicio || fechaFin ? { 
+                fecha: {
+                    ...(fechaInicio && { $gte: new Date(fechaInicio) }),
+                    ...(fechaFin && { $lte: new Date(fechaFin) })
+                }
+            } : {}),
+            ...(operarios.length > 0 ? {
+                operario: { $in: operarios.map(op => op._id) }
+            } : {})
+        }).populate('operario', 'name');
+
+        // Agrupar por operario y fecha para crear jornadas virtuales
+        const jornadasMap = new Map();
+        
+        for (const registro of registrosLaborales) {
+            const fechaKey = new Date(registro.fecha).toDateString();
+            const operarioId = registro.operario._id.toString();
+            const key = `${operarioId}-${fechaKey}`;
+            
+            if (!jornadasMap.has(key)) {
+                jornadasMap.set(key, {
+                    _id: key, // ID virtual
+                    operario: registro.operario,
+                    fecha: registro.fecha,
+                    registros: [],
+                    horaInicio: null,
+                    horaFin: null
+                });
+            }
+            
+            jornadasMap.get(key).registros.push(registro);
+        }
+
+        // Convertir a array y aplicar paginación
+        const todasLasJornadas = Array.from(jornadasMap.values());
+        const total = todasLasJornadas.length;
+        const jornadas = todasLasJornadas
+            .sort((a, b) => new Date(b.fecha) - new Date(a.fecha))
+            .slice(skip, skip + parseInt(limit));
+
+        // Calcular tiempos basándose únicamente en registros de Horario/Permiso Laboral
+        const jornadasOptimizadas = jornadas.map(jornada => {
+            let tiempoEfectivoAPagar = { horas: 0, minutos: 0 };
+            let horaInicio = null;
+            let horaFin = null;
+            
+            // Filtrar registros por tipo
+            const registrosHorarioLaboral = jornada.registros.filter(r => r.tipoTiempo === 'Horario Laboral');
+            const registrosPermisoLaboral = jornada.registros.filter(r => r.tipoTiempo === 'Permiso Laboral');
+            
+            // Calcular horario laboral (hora inicio y fin)
+            if (registrosHorarioLaboral.length > 0) {
+                const horas = registrosHorarioLaboral
+                    .filter(r => r.horaInicio && r.horaFin)
+                    .map(r => ({
+                        inicio: new Date(r.horaInicio),
+                        fin: new Date(r.horaFin)
+                    }));
+                
+                if (horas.length > 0) {
+                    horaInicio = new Date(Math.min(...horas.map(h => h.inicio)));
+                    horaFin = new Date(Math.max(...horas.map(h => h.fin)));
+                    
+                    // Ajustar si la hora fin es menor (día siguiente)
+                    if (horaFin <= horaInicio) {
+                        horaFin = new Date(horaFin.getTime() + 24 * 60 * 60 * 1000);
+                    }
+                    
+                    // Calcular tiempo total de horario laboral
+                    const tiempoTotalMinutos = Math.round((horaFin - horaInicio) / (1000 * 60));
+                    
+                    // Calcular tiempo de permisos NO remunerados para restar
+                    const tiempoPermisosNoRemunerados = registrosPermisoLaboral
+                        .filter(r => r.tipoPermiso && r.tipoPermiso.toLowerCase() === 'permiso no remunerado')
+                        .reduce((total, permiso) => total + (permiso.tiempo || 0), 0);
+                    
+                    // Tiempo efectivo = Horario Laboral - Permisos NO Remunerados
+                    const tiempoEfectivoMinutos = Math.max(0, tiempoTotalMinutos - tiempoPermisosNoRemunerados);
+                    
+                    tiempoEfectivoAPagar = {
+                        horas: Math.floor(tiempoEfectivoMinutos / 60),
+                        minutos: tiempoEfectivoMinutos % 60
+                    };
+                }
+            } else if (registrosPermisoLaboral.length > 0) {
+                // Caso: Solo hay permisos (sin horario laboral)
+                // Calcular tiempo solo de permisos REMUNERADOS
+                const tiempoPermisosRemunerados = registrosPermisoLaboral
+                    .filter(r => r.tipoPermiso && r.tipoPermiso.toLowerCase() === 'permiso remunerado')
+                    .reduce((total, permiso) => {
+                        if (permiso.horaInicio && permiso.horaFin) {
+                            const inicio = new Date(permiso.horaInicio);
+                            let fin = new Date(permiso.horaFin);
+                            
+                            // Ajustar si la hora fin es menor (día siguiente)
+                            if (fin <= inicio) {
+                                fin = new Date(fin.getTime() + 24 * 60 * 60 * 1000);
+                            }
+                            
+                            const minutos = Math.round((fin - inicio) / (1000 * 60));
+                            return total + minutos;
+                        }
+                        return total + (permiso.tiempo || 0);
+                    }, 0);
+                
+                tiempoEfectivoAPagar = {
+                    horas: Math.floor(tiempoPermisosRemunerados / 60),
+                    minutos: tiempoPermisosRemunerados % 60
+                };
+            }
+            
+            return {
+                _id: jornada._id,
+                operario: jornada.operario,
+                fecha: jornada.fecha,
+                horaInicio,
+                horaFin,
+                registros: includeRegistros === 'true' ? jornada.registros : [],
+                tiempoEfectivoAPagar,
+                totalTiempoActividades: { horas: 0, minutos: 0 } // Ya no relevante
+            };
+        });
+
+        res.status(200).json({
+            jornadas: jornadasOptimizadas,
+            pagination: {
+                currentPage: parseInt(page),
+                totalPages: Math.ceil(total / limit),
+                totalItems: total,
+                itemsPerPage: parseInt(limit),
+                hasNextPage: page * limit < total,
+                hasPreviousPage: page > 1
+            }
+        });
+    } catch (error) {
+        console.error('Error fetching paged jornadas:', error);
+        res.status(500).json({ error: 'Error al obtener jornadas paginadas' });
+    }
+};
