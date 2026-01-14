@@ -981,12 +981,33 @@ exports.obtenerJornadasPaginadas = async (req, res) => {
             ...(operarios.length > 0 ? {
                 operario: { $in: operarios.map(op => op._id) }
             } : {})
-        }).populate('operario', 'name');
+        })
+        .populate('operario', 'name')
+        .populate('procesos', 'nombre'); // Agregar populate de procesos para poder filtrar por "Almuerzo"
+
+        // También traer registros de Almuerzo (Alimentación) para el cálculo
+        const registrosAlmuerzo = await Produccion.find({
+            tipoTiempo: 'Alimentación',
+            ...(fechaInicio || fechaFin ? { 
+                fecha: {
+                    ...(fechaInicio && { $gte: new Date(fechaInicio) }),
+                    ...(fechaFin && { $lte: new Date(fechaFin) })
+                }
+            } : {}),
+            ...(operarios.length > 0 ? {
+                operario: { $in: operarios.map(op => op._id) }
+            } : {})
+        })
+        .populate('operario', 'name')
+        .populate('procesos', 'nombre');
+
+        // Combinar todos los registros (laborales + almuerzo)
+        const todosLosRegistros = [...registrosLaborales, ...registrosAlmuerzo];
 
         // Agrupar por operario y fecha para crear jornadas virtuales
         const jornadasMap = new Map();
         
-        for (const registro of registrosLaborales) {
+        for (const registro of todosLosRegistros) {
             const fechaKey = new Date(registro.fecha).toDateString();
             const operarioId = registro.operario._id.toString();
             const key = `${operarioId}-${fechaKey}`;
